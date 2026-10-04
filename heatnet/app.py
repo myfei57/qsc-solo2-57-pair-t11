@@ -18,6 +18,7 @@ from .config import PlatformConfig, default_config
 from .errors import PlantError
 from .eventbus import Event, EventBus
 from .ids import IdFactory
+from .inspection import Inspector, build_probe_plan
 from .ns.registry import NamespaceRegistry
 from .ns.topology import Topology, build_default_topology
 from .ns.zone import Zone, ZoneRegistry
@@ -117,6 +118,23 @@ class Platform:
         self._operations = 0
         self._lock = threading.RLock()
         self._register_namespaces()
+        self.inspection = Inspector(
+            self.namespaces,
+            lambda: build_probe_plan(
+                self.source,
+                self.curve,
+                self.network,
+                self.secondary,
+                self.pump,
+                self.stations,
+                self.valves,
+                self.meters,
+            ),
+            self.clock,
+            self.bus,
+            self.ids,
+            self._lock,
+        )
         self._restore()
 
     # ---- 装配 ---------------------------------------------------------
@@ -210,6 +228,25 @@ class Platform:
             {"operations": self._operations, "cycles": self._cycles, "unit": self.unit},
         )
 
+    def _inspection_gate(self) -> dict:
+        """取巡检闸门状态；还没有任何巡检结论时先补跑一遍（无证据不放行）。"""
+
+        if self.inspection.latest() is None:
+            self.inspection.run("preflight")
+        return self.inspection.gate()
+
+    @staticmethod
+    def _inspection_block_report(gate: dict) -> dict:
+        """闸门关闭时的拒绝报告：不触碰设备，只点出拦住动作的地址。"""
+
+        return {
+            "ok": False,
+            "steps": [],
+            "violations": [f"inspection_block:{address}" for address in gate["blocks"]],
+            "stage": "inspection",
+            "inspection": gate["run_id"],
+        }
+
     def _record_operation(self, op_id: str, operation: str, report: dict) -> dict:
         """把编排步骤逐条写审计，并记一条汇总事件。"""
 
@@ -271,10 +308,11 @@ class Platform:
     # ---- 生命周期 -----------------------------------------------------
 
     def start(self) -> dict:
-        """启动平台：核对命名空间与调度链拓扑。"""
+        """启动平台：核对命名空间与调度链拓扑，并做一遍投运前点表巡检。"""
 
         with self._lock:
             report = self.topology.verify(set())
+            patrol = self.inspection.run("start")
             source_device = self.namespaces.resolve("plant.heat_source")
             return {
                 "unit": self.unit,
@@ -284,6 +322,12 @@ class Platform:
                 "zones": self.zones.describe()["count"],
                 "stations": len(self.stations),
                 "operations": self._operations,
+                "inspection": {
+                    "run_id": patrol["run_id"],
+                    "ok": patrol["ok"],
+                    "evidence": patrol["evidence"],
+                    "counts": patrol["counts"],
+                },
             }
 
     def stop(self) -> dict:
@@ -292,10 +336,22 @@ class Platform:
         return self.shutdown("planned-shutdown")
 
     def startup(self, outdoor_c: float, demand_pct: float = 60.0, station: str = "console") -> dict:
-        """按调度链顺序把平台从冷态带到带负荷。"""
+        """按调度链顺序把平台从冷态带到带负荷。
+
+        投运前强制重巡一遍点表：声明与实际对不上（且触及 block 档设备）时
+        直接拒绝，不再等到启停中途才发现对不上。
+        """
 
         with self._lock:
             op_id = self.ids.next()
+            self.inspection.run("startup-preflight")
+            gate = self.inspection.gate()
+            if not gate["open"]:
+                report = self._inspection_block_report(gate)
+                summary = self._record_operation(op_id, "startup", report)
+                self._operations += 1
+                self._persist()
+                return {**report, **summary, "station": station}
             report = startup_plant(
                 self.source,
                 self.curve,
@@ -389,6 +445,18 @@ class Platform:
             selected = list(zones) if zones else self.zones.names()
             setpoint = self.config.station.setpoint_c if target_c is None else float(target_c)
             op_id = self.ids.next()
+            gate = self._inspection_gate()
+            if not gate["open"]:
+                report = {
+                    **self._inspection_block_report(gate),
+                    "planned": 0,
+                    "adjusted": [],
+                    "flows": [],
+                }
+                summary = self._record_operation(op_id, "dispatch", report)
+                self._operations += 1
+                self._persist()
+                return {**report, **summary}
             report = dispatch_demand(
                 self.service,
                 self.mapping,
@@ -614,6 +682,25 @@ class Platform:
             )
             return {"ok": True, "state": state, "operator": operator}
 
+    # ---- 点表巡检 -----------------------------------------------------
+
+    def inspect_now(self, trigger: str = "manual") -> dict:
+        """立即执行一次点表巡检（供定期核对与控制台触发）。"""
+
+        with self._lock:
+            return self.inspection.run(trigger)
+
+    def apply_disposition(self, address: str) -> dict:
+        """按最近一次巡检的处置建议更正点表，并立即复巡。"""
+
+        with self._lock:
+            return self.inspection.apply(address)
+
+    def inspection_report(self) -> dict:
+        """返回巡检策略、闸门与最近一次完整报告，供控制台展示。"""
+
+        return self.inspection.describe()
+
     # ---- 控制循环 -----------------------------------------------------
 
     def cycle(self, dt: float = 1.0) -> dict:
@@ -812,6 +899,7 @@ class Platform:
             },
             "zones": self.zones.describe(),
             "mapping": self.mapping.describe(),
+            "inspection": self.inspection.summary(),
             "quota": self.quota_report(),
             "store": self.metrics.summary(),
             "audit": self.audit.summary(),

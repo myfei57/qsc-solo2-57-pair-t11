@@ -3,9 +3,10 @@
 五个子命令覆盖日常使用：
 
 ``serve``   启动控制台 HTTP 服务，可选地在启动后探测接口；
-``demo``    在本地跑一遍完整流程（气象推送 → 调质调量 → 投运 → 调度下发 →
-            控制周期 → 流量标定 → 定压改造 → 二次网循环 → 热量采集与结算 →
-            分区拆分 → 阀门队列回放 → 停机与复位），用于交付前的真实运行检查；
+``demo``    在本地跑一遍完整流程（点表巡检 → 气象推送 → 调质调量 → 投运 →
+            调度下发 → 控制周期 → 流量标定 → 定压改造 → 二次网循环 →
+            热量采集与结算 → 分区拆分 → 阀门队列回放 → 停机与复位），
+            用于交付前的真实运行检查；
 ``status``  打印当前状态快照；
 ``config``  打印生效配置；
 ``reset``   清掉落盘的平台计数。
@@ -81,6 +82,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         platform.reset_source("demo-baseline")
 
     startup = platform.start()
+    inspection = platform.inspect_now("demo")
     weather = platform.push_weather(args.outdoor_c, "demo-weather")
     launch = platform.startup(args.outdoor_c, args.demand_pct, "demo-operator")
     preview = platform.plan_preview(args.demand_pct)
@@ -107,6 +109,9 @@ def _cmd_demo(args: argparse.Namespace) -> int:
 
     report = {
         "startup": startup,
+        "inspection": {
+            key: inspection[key] for key in ("run_id", "ok", "evidence", "counts")
+        },
         "weather": {key: weather[key] for key in ("ok", "outdoor_c", "supply_c", "epoch", "violations")},
         "launch": {key: launch[key] for key in ("ok", "stage", "flow_t_h", "supply_c", "violations")},
         "preview": preview[:3],
@@ -134,6 +139,8 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     _dump(report)
 
     failures = [name for name, item in probe.items() if not item["ok"]]
+    if not inspection["ok"]:
+        failures.append(f"inspection:{inspection['counts']}")
     for name, operation in (
         ("weather", weather),
         ("launch", launch),
