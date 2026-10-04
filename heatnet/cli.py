@@ -1,11 +1,13 @@
 """命令行入口。
 
-五个子命令覆盖日常使用：
+六个子命令覆盖日常使用：
 
 ``serve``   启动控制台 HTTP 服务，可选地在启动后探测接口；
 ``demo``    在本地跑一遍完整流程（气象推送 → 调质调量 → 投运 → 调度下发 →
             控制周期 → 流量标定 → 定压改造 → 二次网循环 → 热量采集与结算 →
-            分区拆分 → 阀门队列回放 → 停机与复位），用于交付前的真实运行检查；
+            分区拆分 → 阀门队列回放 → 点表巡检 → 停机与复位），用于交付前的
+            真实运行检查；
+``inspect`` 跑一轮点表巡检（声明对实际），不一致时退出码为 1；
 ``status``  打印当前状态快照；
 ``config``  打印生效配置；
 ``reset``   清掉落盘的平台计数。
@@ -31,6 +33,7 @@ DEFAULT_PROBE_PATHS = (
     "/api/audit",
     "/api/stations",
     "/api/quota",
+    "/api/inspection",
 )
 
 
@@ -96,6 +99,18 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     replayed = platform.replay_valves([args.station])
     disturbance = platform.disturb_secondary(args.disturb)
     concurrency = platform.concurrency_probe(rounds=args.rounds)
+    if args.drift:
+        # 模拟现场漂移：一块热量表断通讯、一个混水阀现场换型、一个站已拆除。
+        platform.inventory.set_online("quota.st01.heat-meter", False)
+        platform.inventory.set_kind("valve.st02.mix", "control-valve")
+        platform.inventory.remove("station.st03")
+    inspection = platform.run_inspection("demo")
+    if args.drift:
+        # 按处置建议执行：恢复通讯、注销已拆除的站、按现场实际更正类型，再复巡确认。
+        platform.inventory.set_online("quota.st01.heat-meter", True)
+        for finding in inspection["findings"]:
+            platform.apply_remedy(finding["remedy"])
+        inspection = platform.run_inspection("demo-remedy")
     trip = platform.trip("demo-complete")
     reset = platform.reset_source("demo-operator")
 
@@ -126,6 +141,9 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "replayed": {key: replayed[key] for key in ("ok", "replayed", "applied")},
         "disturbance": disturbance,
         "concurrency": concurrency,
+        "inspection": {
+            key: inspection[key] for key in ("ok", "verdict", "totals", "blocked_operations")
+        },
         "trip": {key: trip[key] for key in ("ok", "state", "reason", "trips")},
         "reset": {key: reset[key] for key in ("ok", "state")},
         "probe": probe,
@@ -134,6 +152,8 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     _dump(report)
 
     failures = [name for name, item in probe.items() if not item["ok"]]
+    if not inspection["ok"]:
+        failures.append(f"inspection:{inspection['verdict']}")
     for name, operation in (
         ("weather", weather),
         ("launch", launch),
@@ -148,6 +168,13 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         print(f"检查未通过: {failures}", file=sys.stderr)
         return 1
     return 0
+
+
+def _cmd_inspect(args: argparse.Namespace) -> int:
+    platform = _build(args)
+    report = platform.run_inspection("cli")
+    _dump(report)
+    return 0 if report["ok"] else 1
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
@@ -208,8 +235,12 @@ def build_parser() -> argparse.ArgumentParser:
     demo.add_argument("--split-zone", default="north", help="演示拆分源分区")
     demo.add_argument("--new-zone", default="north-west", help="演示拆分出的新分区")
     demo.add_argument("--split-stations", nargs="*", default=["st02", "st03"], help="划入新分区的站")
+    demo.add_argument("--drift", action="store_true", help="模拟现场漂移（断通讯/换型/拆除）并按建议处置")
     demo.add_argument("--fast", action="store_true", help="使用可推进时钟，跳过真实等待")
     demo.set_defaults(func=_cmd_demo)
+
+    inspect_cmd = sub.add_parser("inspect", help="跑一轮点表巡检（声明对实际）", parents=[common])
+    inspect_cmd.set_defaults(func=_cmd_inspect)
 
     status = sub.add_parser("status", help="打印状态快照", parents=[common])
     status.set_defaults(func=_cmd_status)

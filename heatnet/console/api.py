@@ -58,6 +58,9 @@ class Api:
         add("GET", "/api/journal", self._journal)
         add("GET", "/api/store", self._store)
         add("GET", "/api/readiness", self._readiness)
+        add("GET", "/api/inspection", lambda params, body: self._platform.inspection_report())
+        add("POST", "/api/inspect", self._inspect)
+        add("POST", "/api/inspection/remedy", self._remedy)
         add("POST", "/api/weather", self._weather)
         add("POST", "/api/adjust", self._adjust)
         add("POST", "/api/startup", self._startup)
@@ -249,6 +252,12 @@ class Api:
         return {"ready": all(checks.values()), "checks": checks, "info": info}
 
     # ---- 动作 ---------------------------------------------------------
+
+    def _inspect(self, params: dict, body: dict) -> dict:
+        return self._platform.run_inspection(str(body.get("origin", "console")))
+
+    def _remedy(self, params: dict, body: dict) -> dict:
+        return self._platform.apply_remedy(body)
 
     def _weather(self, params: dict, body: dict) -> dict:
         return self._platform.push_weather(

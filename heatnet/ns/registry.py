@@ -51,6 +51,32 @@ class NamespaceRegistry:
         self._devices[address] = entry
         return entry
 
+    def deregister(self, address: str) -> Device:
+        """从点表注销一个地址（巡检确认现场已拆除后执行）。"""
+
+        try:
+            return self._devices.pop(address)
+        except KeyError as error:
+            raise NamespaceError(f"未注册地址: {address}", component="ns") from error
+
+    def correct_kind(self, address: str, kind: str) -> Device:
+        """按现场实际类型更正点表登记。"""
+
+        if not kind:
+            raise NamespaceError("类型不能为空", component="ns")
+        try:
+            entry = self._devices[address]
+        except KeyError as error:
+            raise NamespaceError(f"未注册地址: {address}", component="ns") from error
+        corrected = Device(entry.area, entry.device, str(kind))
+        self._devices[address] = corrected
+        return corrected
+
+    def table(self) -> dict[str, str]:
+        """返回点表（地址 → 类型，按地址排序），供巡检逐点核对。"""
+
+        return {address: self._devices[address].kind for address in sorted(self._devices)}
+
     def resolve(self, address: str) -> Device:
         """按地址解析设备。"""
 

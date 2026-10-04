@@ -1,9 +1,10 @@
 """平台装配与控制循环。
 
 ``Platform`` 把热源、一次网、换热站、二次网、阀门、泵、曲线、定压、热量与审计
-按真实调用链装到一起，并暴露四件事：操作编排（气象推送、调质调量、投运、调度、
-停运、拆分、定压改造）、控制循环、并发探测与状态快照。控制循环每个周期推进热源
-与二次网、把一次网跟随上去、落审计并采集趋势。
+按真实调用链装到一起，并暴露五件事：操作编排（气象推送、调质调量、投运、调度、
+停运、拆分、定压改造）、控制循环、点表巡检（声明对实际，按设备类型决定拦还是记）、
+并发探测与状态快照。控制循环每个周期推进热源与二次网、把一次网跟随上去、落审计
+并采集趋势，每隔固定周期自动跑一轮点表巡检。
 """
 
 from __future__ import annotations
@@ -15,12 +16,23 @@ from .audit.log import AuditLog
 from .audit.record import AuditRecord
 from .clock import Clock, SystemClock
 from .config import PlatformConfig, default_config
-from .errors import PlantError
+from .errors import InterlockError, PlantError
 from .eventbus import Event, EventBus
 from .ids import IdFactory
 from .ns.registry import NamespaceRegistry
 from .ns.topology import Topology, build_default_topology
 from .ns.zone import Zone, ZoneRegistry
+from .pointtable import (
+    AREAS as INSPECT_AREAS,
+    BLOCK as INSPECT_BLOCK,
+    KIND_POLICY as INSPECT_KIND_POLICY,
+    METHOD as INSPECT_METHOD,
+    OPERATION_AREAS as INSPECT_OPERATION_AREAS,
+    FieldInventory,
+    FieldPoint,
+    run_inspection as run_point_inspection,
+    severity_of as inspection_severity,
+)
 from .pressure.baseline import PressureBaseline
 from .pressure.control import PressurisingController
 from .primary.flow import batch_flows
@@ -75,7 +87,10 @@ class Platform:
         config: PlatformConfig | None = None,
         clock: Clock | None = None,
         unit: str = DEFAULT_UNIT,
+        inspect_period_cycles: int = 60,
     ) -> None:
+        if inspect_period_cycles < 0:
+            raise ValueError("巡检周期不能为负")
         self.config = config or default_config()
         self.clock = clock or SystemClock()
         self.bus = EventBus()
@@ -112,9 +127,12 @@ class Platform:
         self.pressure = PressurisingController(
             PressureBaseline(self.config.pressure), self.config.pressure
         )
+        self.inventory = self._build_inventory()
 
         self._cycles = 0
         self._operations = 0
+        self._inspect_period_cycles = int(inspect_period_cycles)
+        self._latest_inspection: dict | None = None
         self._lock = threading.RLock()
         self._register_namespaces()
         self._restore()
@@ -162,6 +180,106 @@ class Platform:
         for name in sorted(self.stations):
             self.meters.register(HeatMeter(f"{name}{_METER_SUFFIX}", wrap))
 
+    def _build_inventory(self) -> FieldInventory:
+        """按真实接线搭现场侧清单（点表巡检的"实际侧"）。
+
+        读点只取设备快照；现场漂移（加站、改址、换型、断通讯）落在清单上，
+        点表登记不会跟着变，巡检负责把两侧的不一致照出来。
+        """
+
+        inventory = FieldInventory()
+        inventory.add(
+            FieldPoint(
+                "plant",
+                "heat_source",
+                "heat-source",
+                lambda: {
+                    "state": self.source.state(),
+                    "supply_c": round(self.source.temperature_c(), 2),
+                },
+            )
+        )
+        inventory.add(
+            FieldPoint(
+                "plant",
+                "weather",
+                "weather-gateway",
+                lambda: {"outdoor_c": round(self.curve.outdoor_c(), 2), "epoch": self.curve.epoch()},
+            )
+        )
+        inventory.add(
+            FieldPoint(
+                "primary",
+                "supply_header",
+                "header",
+                lambda: {"flow_t_h": round(self.network.flow_t_h(), 2)},
+            )
+        )
+        inventory.add(
+            FieldPoint(
+                "primary",
+                "flow_meter",
+                "flow-meter",
+                lambda: {"flow_t_h": round(self.network.flow_t_h(), 2)},
+            )
+        )
+        inventory.add(
+            FieldPoint(
+                "secondary",
+                "circulating_pump",
+                "pump",
+                lambda: {"running": self.pump.running(), "flow_t_h": round(self.pump.flow_t_h(), 2)},
+            )
+        )
+        inventory.add(
+            FieldPoint(
+                "secondary",
+                "makeup_valve",
+                "control-valve",
+                lambda: {
+                    "pressure_kpa": round(self.secondary.pressure_kpa(), 2),
+                    "needs_makeup": self.secondary.needs_makeup(),
+                },
+            )
+        )
+        inventory.add(
+            FieldPoint(
+                "secondary",
+                "pressure_sensor",
+                "pressure-sensor",
+                lambda: {"pressure_kpa": round(self.secondary.pressure_kpa(), 2)},
+            )
+        )
+        for name in sorted(self.stations):
+            station = self.stations[name]
+            valve = self.valves[name]
+            meter = f"{name}{_METER_SUFFIX}"
+            inventory.add(
+                FieldPoint(
+                    "station",
+                    name,
+                    "heat-exchange-station",
+                    lambda station=station: {"zone": station.zone()},
+                )
+            )
+            inventory.add(
+                FieldPoint(
+                    "valve",
+                    f"{name}.mix",
+                    "mix-valve",
+                    lambda valve=valve: {"position_pct": round(valve.position_pct(), 2)},
+                )
+            )
+            inventory.add(
+                FieldPoint(
+                    "quota",
+                    meter,
+                    "heat-meter",
+                    lambda meter=meter: {"total_mwh": round(self.meters.get(meter).total_mwh(), 4)},
+                )
+            )
+        return inventory
+
     def _register_namespaces(self) -> None:
         """登记现场设备命名空间（控制台与审计共用同一套名字）。"""
 
@@ -181,12 +299,15 @@ class Platform:
             self.namespaces.register("quota", f"{name}.heat-meter", "heat-meter")
 
     def _restore(self) -> None:
-        """从落盘状态恢复平台计数与阀门开度。"""
+        """从落盘状态恢复平台计数、阀门开度与最近一次巡检结论。"""
 
         state = self.store.read("platform_state")
         if isinstance(state, dict):
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
+        inspection = self.store.read("inspection/latest")
+        if isinstance(inspection, dict):
+            self._latest_inspection = inspection
         for name, valve in self.valves.items():
             load_valve(valve, self.durable)
             applied = self.checkpoint.load(name)
@@ -268,6 +389,137 @@ class Platform:
         )
         return summary
 
+    # ---- 点表巡检 -----------------------------------------------------
+
+    def run_inspection(self, origin: str = "console") -> dict:
+        """跑一轮点表巡检：声明（点表）对实际（现场清单），结果落盘并写审计。
+
+        巡检只读设备快照，并且与所有控制动作共用同一把锁，读写不会互相打架；
+        发现的锁存一直保留到下一轮巡检把它消掉为止。
+        """
+
+        with self._lock:
+            report = run_point_inspection(
+                self.namespaces.table(), self.inventory, now=self.clock.now(), origin=origin
+            )
+            self._latest_inspection = report
+            self.store.write("inspection/latest", report)
+            for finding in report["findings"]:
+                self.bus.publish(
+                    Event.of(
+                        "pointtable",
+                        "pointtable",
+                        "inspect_finding",
+                        severity="alarm" if finding["policy"] == INSPECT_BLOCK else "warning",
+                        asset=finding["address"],
+                        message=finding["message"],
+                        origin=origin,
+                        finding_class=finding["class"],
+                        policy=finding["policy"],
+                    )
+                )
+            self.bus.publish(
+                Event.of(
+                    "pointtable",
+                    "pointtable",
+                    "inspect",
+                    severity=inspection_severity(report),
+                    message=f"点表巡检 {report['verdict']}",
+                    origin=origin,
+                    verdict=report["verdict"],
+                    totals=report["totals"],
+                    blocked_operations=report["blocked_operations"],
+                )
+            )
+            return report
+
+    def inspection_report(self) -> dict:
+        """返回巡检规则与最近一次报告，供控制台展示。"""
+
+        with self._lock:
+            latest = self._latest_inspection
+            return {
+                "method": INSPECT_METHOD,
+                "order": list(INSPECT_AREAS),
+                "policy": dict(INSPECT_KIND_POLICY),
+                "operation_areas": {
+                    operation: list(areas) for operation, areas in INSPECT_OPERATION_AREAS.items()
+                },
+                "blocked_operations": list(latest["blocked_operations"]) if latest else [],
+                "latest": latest,
+            }
+
+    def apply_remedy(self, remedy: dict) -> dict:
+        """执行一条巡检处置建议（注销／补登／更正类型／复巡单点）。
+
+        处置改的是点表（声明侧），执行后必须用一次新的巡检确认不一致已消除，
+        锁存才会解除。
+        """
+
+        with self._lock:
+            op = str(remedy.get("op", ""))
+            if op == "deregister":
+                device = self.namespaces.deregister(str(remedy["address"]))
+                outcome: dict = {"deregistered": device.address}
+            elif op == "register":
+                device = self.namespaces.register(
+                    str(remedy["area"]), str(remedy["device"]), str(remedy["kind"])
+                )
+                outcome = {"registered": device.address}
+            elif op == "correct-kind":
+                device = self.namespaces.correct_kind(
+                    str(remedy["address"]), str(remedy["actual"])
+                )
+                outcome = {"corrected": device.address, "kind": device.kind}
+            elif op == "re-probe":
+                reading = self.inventory.get(str(remedy["address"])).read()
+                outcome = {"reading": reading.as_dict()}
+            else:
+                raise ValueError(f"未知处置操作: {op!r}")
+            self.bus.publish(
+                Event.of(
+                    "pointtable",
+                    "pointtable",
+                    "remedy_applied",
+                    severity="notice",
+                    message=f"执行点表处置 {op}",
+                    op=op,
+                    **{key: value for key, value in outcome.items() if not isinstance(value, dict)},
+                )
+            )
+            return {"ok": True, "op": op, **outcome}
+
+    def _gate_inspection(self, operation: str) -> None:
+        """巡检锁存：执行链设备存在未消除不一致时，拦住相关动作（按设备类型定）。"""
+
+        report = self._latest_inspection
+        if report is None:
+            return
+        areas = INSPECT_OPERATION_AREAS.get(operation, ())
+        hits = [
+            finding
+            for finding in report["findings"]
+            if finding["policy"] == INSPECT_BLOCK and finding["area"] in areas
+        ]
+        if not hits:
+            return
+        addresses = [finding["address"] for finding in hits]
+        self.bus.publish(
+            Event.of(
+                "pointtable",
+                "pointtable",
+                "inspect_blocked",
+                severity="alarm",
+                message=f"点表巡检未通过，{operation} 被拦截",
+                operation=operation,
+                addresses=addresses,
+            )
+        )
+        raise InterlockError(
+            f"点表巡检未通过：{'、'.join(addresses)} 与现场不一致，{operation} 被拦截",
+            component="pointtable",
+        )
+
     # ---- 生命周期 -----------------------------------------------------
 
     def start(self) -> dict:
@@ -292,9 +544,11 @@ class Platform:
         return self.shutdown("planned-shutdown")
 
     def startup(self, outdoor_c: float, demand_pct: float = 60.0, station: str = "console") -> dict:
-        """按调度链顺序把平台从冷态带到带负荷。"""
+        """按调度链顺序把平台从冷态带到带负荷（投运前先对一遍点表）。"""
 
         with self._lock:
+            self.run_inspection(origin="pre-startup")
+            self._gate_inspection("startup")
             op_id = self.ids.next()
             report = startup_plant(
                 self.source,
@@ -314,9 +568,11 @@ class Platform:
             return {**report, **summary, "station": station}
 
     def shutdown(self, reason: str = "planned-shutdown") -> dict:
-        """停运平台。"""
+        """停运平台（停运前先对一遍点表）。"""
 
         with self._lock:
+            self.run_inspection(origin="pre-shutdown")
+            self._gate_inspection("shutdown")
             op_id = self.ids.next()
             report = shutdown_plant(
                 self.source,
@@ -337,6 +593,7 @@ class Platform:
         """接收一次气象推送并让热源按新曲线点火。"""
 
         with self._lock:
+            self._gate_inspection("weather")
             op_id = self.ids.next()
             report = push_weather(
                 self.source,
@@ -355,6 +612,7 @@ class Platform:
         """把热源供温与流量原子地调整到目标值。"""
 
         with self._lock:
+            self._gate_inspection("adjust")
             adjustment: Adjustment = apply_adjustment(self.source, temperature_c, flow_t_h, origin)
             if adjustment.ok:
                 self.network.set_supply(adjustment.temperature_c)
@@ -386,6 +644,7 @@ class Platform:
         """按分区下发一次调度。"""
 
         with self._lock:
+            self._gate_inspection("dispatch")
             selected = list(zones) if zones else self.zones.names()
             setpoint = self.config.station.setpoint_c if target_c is None else float(target_c)
             op_id = self.ids.next()
@@ -425,6 +684,7 @@ class Platform:
         """下发一次定压基线改造。"""
 
         with self._lock:
+            self._gate_inspection("retrofit")
             report = self.pressure.retrofit(self.secondary, target_kpa)
             self.bus.publish(
                 Event.of(
@@ -442,6 +702,7 @@ class Platform:
         """跑一个二次网循环（结束前泵一定停稳）。"""
 
         with self._lock:
+            self._gate_inspection("secondary_cycle")
             op_id = self.ids.next()
             report = run_cycle(
                 self.secondary,
@@ -459,6 +720,7 @@ class Platform:
         """启动循环泵。"""
 
         with self._lock:
+            self._gate_inspection("pump")
             target = self.pump.start(speed_pct)
             return {"running": self.pump.running(), "target_flow_t_h": round(target, 2)}
 
@@ -466,6 +728,7 @@ class Platform:
         """停循环泵。"""
 
         with self._lock:
+            self._gate_inspection("pump")
             self.pump.stop()
             for _ in range(600):
                 self.pump.step(1.0)
@@ -528,6 +791,7 @@ class Platform:
         """按检查点回放阀门指令队列。"""
 
         with self._lock:
+            self._gate_inspection("replay")
             selected = list(stations) if stations else sorted(self.queues)
             reports = [
                 replay_queue(
@@ -551,6 +815,7 @@ class Platform:
         """向某个站的阀门队列写入一组目标开度。"""
 
         with self._lock:
+            self._gate_inspection("queue")
             queue = self.queues[station]
             commands = [queue.enqueue(target, source) for target in targets]
             return {"station": station, "queued": [command.as_dict() for command in commands]}
@@ -559,6 +824,7 @@ class Platform:
         """采集一次热量并记进本期总账。"""
 
         with self._lock:
+            self._gate_inspection("meter")
             reading = self.meters.collect(meter, delta_mwh)
             self.ledger.allocate(meter[: -len(_METER_SUFFIX)], delta_mwh)
             self.trend.append("heat_mwh", self.clock.now(), self.meters.total_mwh())
@@ -634,6 +900,8 @@ class Platform:
             self.trend.append("network_flow_t_h", moment, self.network.flow_t_h())
             self.trend.append("pressure_kpa", moment, self.secondary.pressure_kpa())
             self._persist()
+            if self._inspect_period_cycles and self._cycles % self._inspect_period_cycles == 0:
+                self.run_inspection(origin="periodic")
             return {"cycle": self._cycles, **report}
 
     def concurrency_probe(self, rounds: int = 24) -> dict:
@@ -773,6 +1041,7 @@ class Platform:
     def status(self) -> dict:
         """汇总状态快照，供控制台与命令行读取。"""
 
+        latest = self._latest_inspection
         return {
             "platform": self.config.name,
             "unit": self.unit,
@@ -780,6 +1049,11 @@ class Platform:
             "cycles": self._cycles,
             "now": round(self.clock.now(), 3),
             "utc": self.clock.utc_iso(),
+            "inspection": {
+                "verdict": latest["verdict"] if latest else "never",
+                "findings": len(latest["findings"]) if latest else 0,
+                "blocked_operations": list(latest["blocked_operations"]) if latest else [],
+            },
             "source": {
                 **self.source.snapshot().as_dict(),
                 "limits": [self.config.source.flow_min_t_h, self.config.source.flow_max_t_h],
@@ -861,10 +1135,11 @@ def build_platform(
     clock: Clock | None = None,
     storage_root: str | None = None,
     unit: str = DEFAULT_UNIT,
+    inspect_period_cycles: int = 60,
 ) -> Platform:
     """构造一个平台；``storage_root`` 可覆盖配置里的存储目录。"""
 
     base = config or default_config()
     if storage_root is not None:
         base = dataclasses.replace(base, storage_root=storage_root)
-    return Platform(base, clock=clock, unit=unit)
+    return Platform(base, clock=clock, unit=unit, inspect_period_cycles=inspect_period_cycles)
